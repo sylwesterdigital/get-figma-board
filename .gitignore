@@ -219,3 +219,9 @@ marimo/_lsp/
 __marimo__/
 TOKEN
 TOKEN
+/output/
+*.json
+*.png
+venv/
+__pycache__/
+.DS_Store
