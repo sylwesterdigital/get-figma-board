@@ -3,6 +3,8 @@ TOKEN
 
 .DS_Store
 
+outputs/
+output/
 archive/
 design/
 *.psd
