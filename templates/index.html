@@ -47,7 +47,6 @@
 <body>
   <div class="wrap">
     <h1>Figma Exporter</h1>
-
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
     <div class="card">
@@ -71,7 +70,12 @@
       <div class="row" style="margin-top:12px">
         <div class="col">
           <label>Format</label>
-          <select id="fmt"><option value="png">png</option><option value="jpg">jpg</option><option value="svg">svg</option><option value="pdf">pdf</option></select>
+          <select id="fmt">
+            <option value="png" selected>png</option>
+            <option value="jpg">jpg</option>
+            <option value="svg">svg</option>
+            <option value="pdf">pdf</option>
+          </select>
         </div>
         <div class="col">
           <label>Scale</label>
@@ -97,7 +101,7 @@
             <option value="descendants">Selected + descendants</option>
             <option value="leaves">Deepest layers (leaf nodes)</option>
           </select>
-          <div class="small muted">Use <b>SVG + Leaves</b> for layered exports.</div>
+          <div class="small muted">Use <b>SVG + Leaves</b> for layered vector. Use PNG/JPG + Crop to parent to raster at frame size.</div>
         </div>
       </div>
 
@@ -127,11 +131,12 @@
           <div id="tree" class="tree"></div>
         </div>
 
-        <!-- RIGHT: selected previews -->
+        <!-- RIGHT: selected previews and actions -->
         <div>
           <div class="bar"><strong>Selected previews</strong><span id="selected-count" class="pill">0</span></div>
           <div id="preview-grid" class="grid" style="margin-top:10px"></div>
 
+          <!-- Browser ZIP download -->
           <form id="export-form" method="post" action="/export" style="margin-top:12px">
             <input type="hidden" name="file_key" id="file_key">
             <input type="hidden" name="page_id" id="page_id">
@@ -141,13 +146,61 @@
             <input type="hidden" name="svg_include_id" id="svg_include_id_field" value="true">
             <input type="hidden" name="svg_simplify_stroke" id="svg_simplify_stroke_field" value="">
             <input type="hidden" name="granularity" id="granularity-field" value="selected">
-            <!-- injected: <input name="ids" value="..."> -->
+            <!-- ids[] injected dynamically -->
             <div class="bar" style="margin-top:12px">
-              <div class="small muted">Exports each checked node (expanded per granularity) as its own file.</div>
+              <div class="small muted">Exports each checked node (expanded per granularity) as a ZIP.</div>
               <div class="spacer"></div>
-              <button id="export-btn" type="submit">Export checked as ZIP</button>
+              <button id="export-btn" type="submit">Download ZIP</button>
             </div>
           </form>
+
+          <!-- Server-side save & crop -->
+          <div class="card" style="margin-top:12px">
+            <div class="row">
+              <div class="col">
+                <label>Save root (server path)</label>
+                <input id="save_root" placeholder="e.g. ./output or /var/www/assets"/>
+              </div>
+              <div class="col">
+                <label>Folder pattern</label>
+                <input id="folder_pattern" value="{page}/{parent_name}"/>
+                <div class="small muted">Placeholders: {page} {parent_name} {parent_id}</div>
+              </div>
+              <div class="col">
+                <label>Filename pattern</label>
+                <input id="filename_pattern" value="{node_name}__{node_id}.{ext}"/>
+                <div class="small muted">Placeholders: {node_name} {node_id} {ext}</div>
+              </div>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <div class="col">
+                <label>Crop to parent size</label>
+                <select id="crop">
+                  <option value="true" selected>true</option>
+                  <option value="false">false</option>
+                </select>
+                <div class="small muted">Raster only (png/jpg). Makes a frame-sized image with the layer positioned inside.</div>
+              </div>
+              <div class="col">
+                <label>Parent mode</label>
+                <select id="parent_mode">
+                  <option value="nearest_frame" selected>Nearest FRAME</option>
+                  <option value="nearest_section">Nearest SECTION/FRAME</option>
+                  <option value="specific">Specific node ID</option>
+                </select>
+              </div>
+              <div class="col">
+                <label>Specific parent ID (if chosen)</label>
+                <input id="parent_id" placeholder="e.g. 601:322"/>
+              </div>
+            </div>
+            <div class="bar" style="margin-top:12px">
+              <div class="small muted">Server save respects your current Format/Scale/Granularity above.</div>
+              <div class="spacer"></div>
+              <button id="save-server-btn">Export crop to size (save to server)</button>
+            </div>
+            <div id="save-result" class="small" style="margin-top:8px;color:#0a0"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -162,7 +215,7 @@
       const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
     }
 
-// ---------- File & page loading ----------
+    // ---------- File & page loading ----------
     async function loadPages(){
       const fileVal = $('file-input').value.trim(); if(!fileVal) return;
       $('pages-card').style.display='none'; $('page-card').style.display='none'; $('file-meta').textContent='Fetching pages…';
@@ -174,7 +227,7 @@
       STATE.pages.forEach(p=>{
         const tile = document.createElement('div'); tile.className='tile';
         tile.innerHTML = `<div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
-      <div><div><strong>${p.name}</strong></div><div class="small muted">${p.id}</div></div>
+          <div><div><strong>${p.name}</strong></div><div class="small muted">${p.id}</div></div>
         <div><button data-id="${p.id}" data-name="${p.name}">Open</button></div></div>`;
         tile.querySelector('button').addEventListener('click', ()=>openPage(p.id, p.name));
         $('pages-list').appendChild(tile);
@@ -190,147 +243,164 @@
       renderTree(); refreshSelectionPreview(); updateSvgControlsVisibility(); $('page-card').style.display='block';
     }
 
-// ---------- Layer tree UI ----------
+    // ---------- Layer tree UI ----------
     function renderTree(){
       const container = $('tree'); container.innerHTML=''; const filter = $('tree-search').value.trim().toLowerCase();
-  const nodesFlat = []; // for bulk copy on "visible"
+      const nodesFlat = [];
 
-  function match(node){ return !filter || (node.name || '').toLowerCase().includes(filter); }
-  function anyDescMatch(node){ if(match(node)) return true; return (node.children||[]).some(anyDescMatch); }
+      function match(node){ return !filter || (node.name || '').toLowerCase().includes(filter); }
+      function anyDescMatch(node){ if(match(node)) return true; return (node.children||[]).some(anyDescMatch); }
 
-  function row(node, depth){
-    const hasChildren = (node.children && node.children.length); const expanded = STATE.expanded.has(node.id);
-    if(filter && !anyDescMatch(node)) return;
+      function row(node, depth){
+        const hasChildren = (node.children && node.children.length); const expanded = STATE.expanded.has(node.id);
+        if(filter && !anyDescMatch(node)) return;
 
-    const div = document.createElement('div'); div.className='node'; div.style.marginLeft=(depth*8)+'px';
-    const twisty = document.createElement('span'); twisty.className='twisty'; twisty.textContent = hasChildren ? (expanded?'▾':'▸') : '';
-    if(hasChildren){ twisty.title='Expand/Collapse'; twisty.addEventListener('click', ()=>{ expanded?STATE.expanded.delete(node.id):STATE.expanded.add(node.id); renderTree();}); }
+        const div = document.createElement('div'); div.className='node'; div.style.marginLeft=(depth*8)+'px';
+        const twisty = document.createElement('span'); twisty.className='twisty'; twisty.textContent = hasChildren ? (expanded?'▾':'▸') : '';
+        if(hasChildren){ twisty.title='Expand/Collapse'; twisty.addEventListener('click', ()=>{ expanded?STATE.expanded.delete(node.id):STATE.expanded.add(node.id); renderTree();}); }
 
-    const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = STATE.checked.has(node.id);
-    cb.addEventListener('change', ()=>{ cb.checked?STATE.checked.add(node.id):STATE.checked.delete(node.id); refreshSelectionPreview(); });
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = STATE.checked.has(node.id);
+        cb.addEventListener('change', ()=>{ cb.checked?STATE.checked.add(node.id):STATE.checked.delete(node.id); refreshSelectionPreview(); });
 
-    const name = document.createElement('div'); name.className='name'; name.textContent = node.name || node.id; name.title = node.name || node.id;
-    name.style.cursor='pointer';
-    name.addEventListener('click', ()=>{ cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
+        const name = document.createElement('div'); name.className='name'; name.textContent = node.name || node.id; name.title = node.name || node.id;
+        name.style.cursor='pointer';
+        name.addEventListener('click', ()=>{ cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
 
-    const type = document.createElement('div'); type.className='type'; type.textContent = node.type || '';
+        const type = document.createElement('div'); type.className='type'; type.textContent = node.type || '';
+        const copyBtn = document.createElement('button'); copyBtn.className='copybtn'; copyBtn.textContent='⧉'; copyBtn.title='Copy “name__id”';
+        copyBtn.addEventListener('click', (e)=>{ e.stopPropagation(); copyText(`${node.name || node.id}__${node.id}`); });
 
-    const idSpan = document.createElement('div'); idSpan.className='id'; idSpan.textContent = node.id; idSpan.title='Click to copy ID';
-    idSpan.style.cursor='copy';
-    idSpan.addEventListener('click', ()=>copyText(node.id));
+        div.appendChild(twisty); div.appendChild(cb); div.appendChild(name); div.appendChild(type); div.appendChild(copyBtn);
 
-    const copyBtn = document.createElement('button'); copyBtn.className='copybtn'; copyBtn.textContent='⧉';
-    copyBtn.title='Copy “name__id”';
-    copyBtn.addEventListener('click', (e)=>{ e.stopPropagation(); copyText(`${node.name || node.id}__${node.id}`); });
+        // line with ID
+        const idSpan = document.createElement('div'); idSpan.className='id'; idSpan.textContent = node.id; idSpan.title='Click to copy ID'; idSpan.style.cursor='copy';
+        idSpan.addEventListener('click', ()=>copyText(node.id));
+        const idRow = document.createElement('div'); idRow.style.gridColumn='1 / -1'; idRow.appendChild(idSpan);
 
-    div.appendChild(twisty); div.appendChild(cb); div.appendChild(name); div.appendChild(type); div.appendChild(copyBtn);
-    // second line with ID (full width)
-    const idRow = document.createElement('div'); idRow.style.gridColumn='1 / -1'; idRow.appendChild(idSpan);
-    const wrap = document.createElement('div'); wrap.appendChild(div); wrap.appendChild(idRow);
-    container.appendChild(wrap);
+        const wrap = document.createElement('div'); wrap.appendChild(div); wrap.appendChild(idRow);
+        container.appendChild(wrap);
 
-    nodesFlat.push({id:node.id, name:node.name||node.id, type:node.type||''});
+        nodesFlat.push({id:node.id, name:node.name||node.id, type:node.type||''});
+        if(hasChildren && expanded){ node.children.forEach(ch=>row(ch, depth+1)); }
+      }
+      (STATE.tree.children || []).forEach(ch=>row(ch, 0));
 
-    if(hasChildren && expanded){ node.children.forEach(ch=>row(ch, depth+1)); }
-  }
+      $('copy-visible-names').onclick = ()=>copyText(nodesFlat.map(n=>n.name).join('\n'));
+      $('copy-visible-ids').onclick   = ()=>copyText(nodesFlat.map(n=>n.id).join('\n'));
+      $('copy-selected-names').onclick= ()=>{ const set=new Set([...STATE.checked]); copyText(nodesFlat.filter(n=>set.has(n.id)).map(n=>n.name).join('\n')); };
+      $('copy-selected-ids').onclick  = ()=>{ const set=new Set([...STATE.checked]); copyText(nodesFlat.filter(n=>set.has(n.id)).map(n=>n.id).join('\n')); };
+      $('download-selected-json').onclick = ()=>{
+        const set=new Set([...STATE.checked]); const arr=nodesFlat.filter(n=>set.has(n.id));
+        const blob=new Blob([JSON.stringify(arr,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='selected_layers.json'; a.click(); URL.revokeObjectURL(a.href);
+      };
+      $('download-selected-csv').onclick = ()=>{
+        const set=new Set([...STATE.checked]); const arr=nodesFlat.filter(n=>set.has(n.id));
+        const csv=['name,type,id',...arr.map(n=>`"${n.name.replace(/"/g,'""')}",${n.type},"${n.id}"`)].join('\n');
+        const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='selected_layers.csv'; a.click(); URL.revokeObjectURL(a.href);
+      };
+    }
 
-  (STATE.tree.children || []).forEach(ch=>row(ch, 0));
+    $('tree-search').addEventListener('input', ()=>renderTree());
+    $('tree-expand').addEventListener('click', ()=>{
+      function collect(n,s){ s.add(n.id); (n.children||[]).forEach(c=>collect(c,s)); }
+      const s=new Set(); (STATE.tree.children||[]).forEach(n=>collect(n,s)); STATE.expanded=s; renderTree();
+    });
+    $('tree-collapse').addEventListener('click', ()=>{ STATE.expanded=new Set([STATE.tree.id]); renderTree(); });
+    $('tree-check-all').addEventListener('click', ()=>{
+      function collect(n,s){ s.add(n.id); (n.children||[]).forEach(c=>collect(c,s)); }
+      const s=new Set(); (STATE.tree.children||[]).forEach(n=>collect(n,s)); STATE.checked=s; renderTree(); refreshSelectionPreview();
+    });
+    $('tree-uncheck-all').addEventListener('click', ()=>{ STATE.checked.clear(); renderTree(); refreshSelectionPreview(); });
 
-  // wire bulk copy buttons against the latest visible set
-  $('copy-visible-names').onclick = ()=>copyText(nodesFlat.map(n=>n.name).join('\n'));
-  $('copy-visible-ids').onclick   = ()=>copyText(nodesFlat.map(n=>n.id).join('\n'));
-  $('copy-selected-names').onclick= ()=>{
-    const set = new Set([...STATE.checked]);
-    const arr = nodesFlat.filter(n=>set.has(n.id)).map(n=>n.name);
-    copyText(arr.join('\n'));
-  };
-  $('copy-selected-ids').onclick  = ()=>{
-    const set = new Set([...STATE.checked]);
-    const arr = nodesFlat.filter(n=>set.has(n.id)).map(n=>n.id);
-    copyText(arr.join('\n'));
-  };
-  $('download-selected-json').onclick = ()=>{
-    const set = new Set([...STATE.checked]);
-    const arr = nodesFlat.filter(n=>set.has(n.id));
-    const blob = new Blob([JSON.stringify(arr,null,2)],{type:'application/json'});
-    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='selected_layers.json'; a.click(); URL.revokeObjectURL(a.href);
-  };
-  $('download-selected-csv').onclick = ()=>{
-    const set = new Set([...STATE.checked]);
-    const arr = nodesFlat.filter(n=>set.has(n.id));
-    const csv = ['name,type,id', ...arr.map(n=>`"${n.name.replace(/"/g,'""')}",${n.type},"${n.id}"`)].join('\n');
-    const blob = new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='selected_layers.csv'; a.click(); URL.revokeObjectURL(a.href);
-  };
-}
+    // ---------- Previews ----------
+    async function refreshSelectionPreview(){
+      const ids = [...STATE.checked]; $('selected-count').textContent = ids.length;
+      const grid = $('preview-grid'); grid.innerHTML='';
+      const form = $('export-form');
+      [...form.querySelectorAll('input[name="ids"]')].forEach(n=>n.remove());
+      ids.slice(0,500).forEach(id=>{ const i=document.createElement('input'); i.type='hidden'; i.name='ids'; i.value=id; form.appendChild(i); });
 
-$('tree-search').addEventListener('input', ()=>renderTree());
-$('tree-expand').addEventListener('click', ()=>{
-  function collect(n,s){ s.add(n.id); (n.children||[]).forEach(c=>collect(c,s)); }
-  const s=new Set(); (STATE.tree.children||[]).forEach(n=>collect(n,s)); STATE.expanded=s; renderTree();
-});
-$('tree-collapse').addEventListener('click', ()=>{ STATE.expanded=new Set([STATE.tree.id]); renderTree(); });
-$('tree-check-all').addEventListener('click', ()=>{
-  function collect(n,s){ s.add(n.id); (n.children||[]).forEach(c=>collect(c,s)); }
-  const s=new Set(); (STATE.tree.children||[]).forEach(n=>collect(n,s)); STATE.checked=s; renderTree(); refreshSelectionPreview();
-});
-$('tree-uncheck-all').addEventListener('click', ()=>{ STATE.checked.clear(); renderTree(); refreshSelectionPreview(); });
+      if(ids.length===0){ const p=document.createElement('p'); p.className='small muted'; p.textContent='No layers selected.'; grid.appendChild(p); return; }
 
-// ---------- Previews of selected nodes ----------
-async function refreshSelectionPreview(){
-  const ids = [...STATE.checked]; $('selected-count').textContent = ids.length;
-  const grid = $('preview-grid'); grid.innerHTML='';
-  const form = $('export-form');
-  [...form.querySelectorAll('input[name="ids"]')].forEach(n=>n.remove());
-  ids.slice(0,500).forEach(id=>{ const i=document.createElement('input'); i.type='hidden'; i.name='ids'; i.value=id; form.appendChild(i); });
+      const fmt = ($('fmt').value === 'jpg') ? 'jpg' : 'png';
+      const scale = $('scale').value || '2';
+      const res = await fetch('/api/thumbs', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ file_key: STATE.file_key, ids: ids.slice(0,80), format: fmt, scale: parseInt(scale,10) })
+      });
+      const data = await res.json(); const map = (data.ok ? data.images : {}) || {};
+      ids.slice(0,80).forEach(id=>{
+        const block = document.createElement('div'); block.className='tile';
+        const url = map[id] || '';
+        block.innerHTML = `<div>${url?`<img src="${url}" alt="${id}">`:`<div class="small muted">No preview</div>`}<div class="small muted" style="margin-top:6px">${id}</div></div>`;
+        grid.appendChild(block);
+      });
+    }
 
-  if(ids.length===0){ const p=document.createElement('p'); p.className='small muted'; p.textContent='No layers selected.'; grid.appendChild(p); return; }
+    // ---------- Options ----------
+    function updateSvgControlsVisibility(){
+      const isSvg = $('fmt').value === 'svg';
+      ['outlines','svg_include_id','svg_simplify_stroke'].forEach(id=>{ $(id).disabled=!isSvg; });
+      $('svg-hint').style.display = isSvg ? 'block' : 'none';
+    }
+    function syncOptions(refresh=true){
+      $('format-field').value=$('fmt').value;
+      $('scale-field').value=$('scale').value;
+      $('outlines-field').value=$('outlines').value;
+      $('svg_include_id_field').value=$('svg_include_id').value;
+      $('svg_simplify_stroke_field').value=$('svg_simplify_stroke').value;
+      $('granularity-field').value=$('granularity').value;
+      updateSvgControlsVisibility();
+      if(refresh && STATE.current_page){ refreshSelectionPreview(); }
+    }
 
-  const fmt = ($('fmt').value === 'jpg') ? 'jpg' : 'png';
-  const scale = $('scale').value || '2';
-  const res = await fetch('/api/thumbs', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ file_key: STATE.file_key, ids: ids.slice(0,80), format: fmt, scale: parseInt(scale,10) })
-  });
-  const data = await res.json(); const map = (data.ok ? data.images : {}) || {};
-  ids.slice(0,80).forEach(id=>{
-    const block = document.createElement('div'); block.className='tile';
-    const url = map[id] || '';
-    block.innerHTML = `<div>${url?`<img src="${url}" alt="${id}">`:`<div class="small muted">No preview</div>`}<div class="small muted" style="margin-top:6px">${id}</div></div>`;
-    grid.appendChild(block);
-  });
-}
+    async function onExport(e){
+      e.preventDefault();
+      const fd = new FormData($('export-form'));
+      if(!fd.getAll('ids').length){ alert('Select at least one layer in the tree.'); return; }
+      const btn = $('export-btn'); btn.disabled=true; btn.textContent='Preparing…';
+      const res = await fetch('/export',{method:'POST', body:fd});
+      if(!res.ok){ btn.disabled=false; btn.textContent='Download ZIP'; try{const err=await res.json(); alert(err.error||err.message||'Export failed');}catch{alert('Export failed');} return; }
+      const blob = await res.blob(); const ts=new Date().toISOString().replace(/[:.]/g,''); const fmt=$('format-field').value||'png'; const pageId=$('page_id').value||'page';
+      const filename=`figma-export-${pageId}-${fmt}-${ts}.zip`; const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url);
+      btn.disabled=false; btn.textContent='Download ZIP';
+    }
 
-// ---------- Options / export ----------
-function updateSvgControlsVisibility(){
-  const isSvg = $('fmt').value === 'svg';
-  ['outlines','svg_include_id','svg_simplify_stroke'].forEach(id=>{ $(id).disabled=!isSvg; });
-  $('svg-hint').style.display = isSvg ? 'block' : 'none';
-}
-function syncOptions(refresh=true){
-  $('format-field').value=$('fmt').value;
-  $('scale-field').value=$('scale').value;
-  $('outlines-field').value=$('outlines').value;
-  $('svg_include_id_field').value=$('svg_include_id').value;
-  $('svg_simplify_stroke_field').value=$('svg_simplify_stroke').value;
-  $('granularity-field').value=$('granularity').value;
-  updateSvgControlsVisibility();
-  if(refresh && STATE.current_page){ refreshSelectionPreview(); }
-}
-async function onExport(e){
-  e.preventDefault();
-  const fd = new FormData($('export-form'));
-  if(!fd.getAll('ids').length){ alert('Select at least one layer in the tree.'); return; }
-  const btn = $('export-btn'); btn.disabled=true; btn.textContent='Exporting…';
-  const res = await fetch('/export',{method:'POST', body:fd});
-  if(!res.ok){ btn.disabled=false; btn.textContent='Export checked as ZIP'; try{const err=await res.json(); alert(err.error||err.message||'Export failed');}catch{alert('Export failed');} return; }
-  const blob = await res.blob(); const ts=new Date().toISOString().replace(/[:.]/g,''); const fmt=$('format-field').value||'png'; const pageId=$('page_id').value||'page';
-  const filename=`figma-export-${pageId}-${fmt}-${ts}.zip`; const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url);
-  btn.disabled=false; btn.textContent='Export checked as ZIP';
-}
+    async function onSaveToServer(){
+      const ids = [...STATE.checked]; if(!ids.length){ alert('Select at least one layer.'); return; }
+      const payload = {
+        file_key: STATE.file_key,
+        page_id: $('page_id').value,
+        ids,
+        format: $('fmt').value,            // server validates + coerces when cropping
+        scale: parseInt($('scale').value,10),
+        outlines: $('outlines').value === 'true',
+        svg_include_id: $('svg_include_id').value === 'true',
+        svg_simplify_stroke: (()=>{
+          const v=$('svg_simplify_stroke').value; if(v==='') return null; if(v==='true') return true; return false;
+        })(),
+        granularity: $('granularity').value,
+        save_root: $('save_root').value || './output',
+        folder_pattern: $('folder_pattern').value || '{page}/{parent_name}',
+        filename_pattern: $('filename_pattern').value || '{node_name}__{node_id}.{ext}',
+        crop: $('crop').value === 'true',
+        parent_mode: $('parent_mode').value,
+        parent_id: $('parent_id').value || null
+      };
+      const btn = $('save-server-btn'); const out = $('save-result');
+      btn.disabled = true; out.style.color='#666'; out.textContent = 'Saving to server…';
+      const res = await fetch('/export_to_disk', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+      const data = await res.json();
+      btn.disabled = false;
+      if(!data.ok){ out.style.color='#b00020'; out.textContent = data.error || data.message || 'Save failed'; return; }
+      out.style.color = '#0a0';
+      out.textContent = `Saved ${data.saved_count} file(s). ${data.errors && data.errors.length ? 'Errors: '+data.errors.length : ''}`;
+    }
 
-$('load-btn').addEventListener('click', loadPages);
-['fmt','scale','outlines','svg_include_id','svg_simplify_stroke','granularity'].forEach(id=>$(id).addEventListener('change',()=>syncOptions(true)));
-$('export-form').addEventListener('submit', onExport);
-</script>
+    $('load-btn').addEventListener('click', loadPages);
+    ['fmt','scale','outlines','svg_include_id','svg_simplify_stroke','granularity'].forEach(id=>$(id).addEventListener('change',()=>syncOptions(true)));
+    $('export-form').addEventListener('submit', onExport);
+    $('save-server-btn').addEventListener('click', onSaveToServer);
+  </script>
 </body>
 </html>
